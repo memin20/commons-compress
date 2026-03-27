@@ -23,6 +23,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.zip.CRC32;
 import java.nio.ByteBuffer;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.Charset;
@@ -53,8 +54,13 @@ import org.apache.commons.lang3.ArrayUtils;
  * </p>
  * <p>
  * If SeekableByteChannel cannot be used, this implementation will use a Data Descriptor to store size and CRC information for {@link #DEFLATED DEFLATED}
- * entries, you don't need to calculate them yourself. Unfortunately, this is not possible for the {@link #STORED STORED} method, where setting the CRC and
- * uncompressed size information is required before {@link #putArchiveEntry(ZipArchiveEntry)} can be called.
+ * entries as well as for Zstandard ({@link ZipMethod#ZSTD}) and {@link ZipMethod#XZ XZ} when writing to a non-seekable stream, so you do not need to know
+ * compressed or uncompressed sizes up front. For {@link #STORED STORED}, CRC and uncompressed size must still be known before {@link
+ * #putArchiveEntry(ZipArchiveEntry)} when the output is not seekable.
+ * <p>
+ * For Zstandard (and similar) you can register a {@link ZipCompressionPayloadWriterFactory} via {@link #setCompressionPayloadWriterFactory(int,
+ * ZipCompressionPayloadWriterFactory)} so {@link #write(byte[], int, int)} accepts <em>uncompressed</em> bytes; see {@link ZipCompressionPayloadWriters}.
+ * </p>
  * </p>
  * <p>
  * As of Apache Commons Compress 1.3, the class transparently supports Zip64 extensions and thus individual entries and archives larger than 4 GB or with more
@@ -105,6 +111,21 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
          * </p>
          */
         private boolean hasWritten;
+
+        /**
+         * When non-null, {@link ZipArchiveOutputStream#write} forwards plain bytes here and CRC/uncompressed size are tracked outside {@link StreamCompressor}.
+         */
+        private ZipCompressionPayloadWriter compressionPayloadWriter;
+
+        /**
+         * CRC-32 of plain bytes when using {@link #compressionPayloadWriter}.
+         */
+        private CRC32 plaintextCrc32;
+
+        /**
+         * Whether this entry uses a registered {@link ZipCompressionPayloadWriter}.
+         */
+        private boolean usesCompressionPayloadWriter;
 
         private CurrentEntry(final ZipArchiveEntry entry) {
             this.entry = entry;
@@ -384,6 +405,11 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
     private final Map<Integer, Integer> numberOfCDInDiskData = new HashMap<>();
 
     /**
+     * Optional payload compressor per ZIP method code (e.g. {@link ZipMethod#ZSTD}).
+     */
+    private final Map<Integer, ZipCompressionPayloadWriterFactory> compressionPayloadWriterFactories = new HashMap<>();
+
+    /**
      * Creates a new ZIP OutputStream writing to a File. Will use random access if possible.
      *
      * @param file the file to ZIP to.
@@ -563,6 +589,14 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
 
     /**
      * Closes this output stream and releases any system resources associated with the stream.
+     * <p>
+     * If the archive is not {@linkplain #finish() finished} yet, this method calls {@code finish()} first. That writes the central directory and end-of-central
+     * record, and closes any still-open entry that uses a {@link ZipCompressionPayloadWriter} (see {@link #finish()}).
+     * </p>
+     * <p>
+     * You can therefore use try-with-resources on this stream and omit both {@link #finish()} and the final {@link #closeArchiveEntry()} for the last entry when
+     * writing with a {@link #setCompressionPayloadWriterFactory registered} payload writer: {@code close()} performs them in the right order.
+     * </p>
      *
      * @throws IOException            if an I/O error occurs.
      * @throws Zip64RequiredException if the archive's size exceeds 4 GByte or there are more than 65535 entries inside the archive and {@link #setUseZip64} is
@@ -589,11 +623,13 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
     public void closeArchiveEntry() throws IOException {
         preClose();
 
-        flushDeflater();
+        flushActiveEntryCompression();
 
         final long bytesWritten = streamCompressor.getTotalBytesWritten() - entry.dataStart;
-        final long realCrc = streamCompressor.getCrc32();
-        entry.bytesRead = streamCompressor.getBytesRead();
+        final long realCrc = entry.usesCompressionPayloadWriter ? entry.plaintextCrc32.getValue() : streamCompressor.getCrc32();
+        if (!entry.usesCompressionPayloadWriter) {
+            entry.bytesRead = streamCompressor.getBytesRead();
+        }
         final Zip64Mode effectiveMode = getEffectiveZip64Mode(entry.entry);
         final boolean actuallyNeedsZip64 = handleSizesAndCrc(bytesWritten, realCrc, effectiveMode);
         closeEntry(actuallyNeedsZip64, false);
@@ -841,6 +877,7 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
         // store method in local variable to prevent multiple method calls
         final int zipMethod = ze.getMethod();
         final boolean dataDescriptor = usesDataDescriptor(zipMethod, phased);
+        final boolean zeroLfhCrcAndSizes = !phased && (zipMethod == DEFLATED || out instanceof RandomAccessOutputStream || dataDescriptor);
 
         ZipShort.putShort(versionNeededToExtract(zipMethod, hasZip64Extra(ze), dataDescriptor), buf, LFH_VERSION_NEEDED_OFFSET);
 
@@ -853,7 +890,7 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
         ZipUtil.toDosTime(ze.getTime(), buf, LFH_TIME_OFFSET);
 
         // CRC
-        if (phased || !(zipMethod == DEFLATED || out instanceof RandomAccessOutputStream)) {
+        if (phased || !zeroLfhCrcAndSizes) {
             ZipLong.putLong(ze.getCrc(), buf, LFH_CRC_OFFSET);
         } else {
             System.arraycopy(LZERO, 0, buf, LFH_CRC_OFFSET, ZipConstants.WORD);
@@ -870,13 +907,10 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
         } else if (phased) {
             ZipLong.putLong(ze.getCompressedSize(), buf, LFH_COMPRESSED_SIZE_OFFSET);
             ZipLong.putLong(ze.getSize(), buf, LFH_ORIGINAL_SIZE_OFFSET);
-        } else if (zipMethod == DEFLATED || out instanceof RandomAccessOutputStream) {
+        } else if (zeroLfhCrcAndSizes) {
             System.arraycopy(LZERO, 0, buf, LFH_COMPRESSED_SIZE_OFFSET, ZipConstants.WORD);
             System.arraycopy(LZERO, 0, buf, LFH_ORIGINAL_SIZE_OFFSET, ZipConstants.WORD);
-        } else if (ZipMethod.isZstd(zipMethod) || zipMethod == ZipMethod.XZ.getCode()) {
-            ZipLong.putLong(ze.getCompressedSize(), buf, LFH_COMPRESSED_SIZE_OFFSET);
-            ZipLong.putLong(ze.getSize(), buf, LFH_ORIGINAL_SIZE_OFFSET);
-        } else { // Stored
+        } else { // Stored (sizes and CRC known up front)
             ZipLong.putLong(ze.getSize(), buf, LFH_COMPRESSED_SIZE_OFFSET);
             ZipLong.putLong(ze.getSize(), buf, LFH_ORIGINAL_SIZE_OFFSET);
         }
@@ -918,6 +952,14 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
 
     /**
      * {@inheritDoc}
+     * <p>
+     * If an entry is still open and uses a {@link #setCompressionPayloadWriterFactory registered} {@link ZipCompressionPayloadWriter}, this method closes that
+     * entry first ({@link #closeArchiveEntry()}) so {@code finish()} may follow {@link #write(byte[], int, int)} without an explicit {@code closeArchiveEntry}
+     * for the last entry. The same applies when {@link #close()} is used instead of {@code finish()} (for example at the end of try-with-resources), since
+     * {@code close()} invokes {@code finish()} if the archive is not finished yet. Multiple {@code write} calls on the same entry still require a manual {@code
+     * closeArchiveEntry} before {@code finish()}/{@code close()} unless the next entry is started with {@link #putArchiveEntry(ZipArchiveEntry)}, which closes
+     * the current entry automatically.
+     * </p>
      *
      * @throws Zip64RequiredException if the archive's size exceeds 4 GByte or there are more than 65535 entries inside the archive and {@link #setUseZip64} is
      *                                {@link Zip64Mode#Never}.
@@ -929,7 +971,11 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
         }
 
         if (entry != null) {
-            throw new ArchiveException("This archive contains unclosed entries.");
+            if (entry.usesCompressionPayloadWriter) {
+                closeArchiveEntry();
+            } else {
+                throw new ArchiveException("This archive contains unclosed entries.");
+            }
         }
 
         final long cdOverallOffset = streamCompressor.getTotalBytesWritten();
@@ -985,7 +1031,12 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
     /**
      * Ensures all bytes sent to the deflater are written to the stream.
      */
-    private void flushDeflater() throws IOException {
+    private void flushActiveEntryCompression() throws IOException {
+        if (entry.compressionPayloadWriter != null) {
+            entry.compressionPayloadWriter.finish();
+            entry.compressionPayloadWriter = null;
+            return;
+        }
         if (entry.entry.getMethod() == DEFLATED) {
             streamCompressor.flushDeflater();
         }
@@ -1008,11 +1059,22 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
      * @since 1.3
      */
     private Zip64Mode getEffectiveZip64Mode(final ZipArchiveEntry ze) {
-        if (zip64Mode != Zip64Mode.AsNeeded || out instanceof RandomAccessOutputStream ||
-                ze.getMethod() != DEFLATED || ze.getSize() != ArchiveEntry.SIZE_UNKNOWN) {
+        if (zip64Mode != Zip64Mode.AsNeeded || out instanceof RandomAccessOutputStream || !isStreamingUnknownSizeCompressedEntry(ze)) {
             return zip64Mode;
         }
         return Zip64Mode.Never;
+    }
+
+    /**
+     * Entries that stream compressed data to a non-seekable output with unknown uncompressed size when the entry is opened (DEFLATED, ZSTD, XZ without payload
+     * writer pre-sizing).
+     */
+    private boolean isStreamingUnknownSizeCompressedEntry(final ZipArchiveEntry ze) {
+        if (ze.getSize() != ArchiveEntry.SIZE_UNKNOWN) {
+            return false;
+        }
+        final int method = ze.getMethod();
+        return method == DEFLATED || ZipMethod.isZstd(method) || method == ZipMethod.XZ.getCode();
     }
 
     /**
@@ -1082,6 +1144,9 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
         } else if (ZipMethod.isZstd(zipMethod) || zipMethod == ZipMethod.XZ.getCode()) {
             entry.entry.setCompressedSize(bytesWritten);
             entry.entry.setCrc(crc);
+            if (entry.usesCompressionPayloadWriter) {
+                entry.entry.setSize(entry.bytesRead);
+            }
         } else if (!(out instanceof RandomAccessOutputStream)) {
             if (entry.entry.getCrc() != crc) {
                 throw new ZipException("Bad CRC checksum for entry " + entry.entry.getName() + ": " + Long.toHexString(entry.entry.getCrc()) + " instead of " +
@@ -1239,6 +1304,23 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
             hasCompressionLevelChanged = false;
         }
         writeLocalFileHeader(archiveEntry, phased);
+        final ZipCompressionPayloadWriterFactory payloadWriterFactory = compressionPayloadWriterFactories.get(entry.entry.getMethod());
+        if (payloadWriterFactory != null) {
+            final OutputStream payloadSink = new OutputStream() {
+                @Override
+                public void write(final int b) throws IOException {
+                    streamCompressor.writeCounted(new byte[] { (byte) b }, 0, 1);
+                }
+
+                @Override
+                public void write(final byte[] b, final int off, final int len) throws IOException {
+                    streamCompressor.writeCounted(b, off, len);
+                }
+            };
+            entry.compressionPayloadWriter = payloadWriterFactory.create(payloadSink, entry.entry);
+            entry.plaintextCrc32 = new CRC32();
+            entry.usesCompressionPayloadWriter = true;
+        }
     }
 
     /**
@@ -1394,6 +1476,26 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
     }
 
     /**
+     * Registers a factory that turns plain {@link #write(byte[], int, int)} data into compressed bytes for the given {@link ZipArchiveEntry#getMethod()
+     * compression method} (for example {@link ZipMethod#ZSTD}{@code .getCode()}). CRC-32 and uncompressed size are computed from the plain data; compressed
+     * size is determined after the entry is closed.
+     * <p>
+     * Pass {@code null} to remove a registration. Unrelated methods are unaffected.
+     * </p>
+     *
+     * @param zipMethod compression method code.
+     * @param factory   factory, or {@code null} to clear.
+     * @since 1.29.0
+     */
+    public void setCompressionPayloadWriterFactory(final int zipMethod, final ZipCompressionPayloadWriterFactory factory) {
+        if (factory == null) {
+            compressionPayloadWriterFactories.remove(zipMethod);
+        } else {
+            compressionPayloadWriterFactories.put(zipMethod, factory);
+        }
+    }
+
+    /**
      * Sets whether to set the language encoding flag if the file name encoding is UTF-8.
      * <p>
      * Defaults to true.
@@ -1420,7 +1522,8 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
      * When setting the mode to {@link Zip64Mode#AsNeeded AsNeeded}, Zip64 extensions will transparently be used for those entries that require them. This mode
      * can only be used if the uncompressed size of the {@link ZipArchiveEntry} is known when calling {@link #putArchiveEntry} or the archive is written to a
      * seekable output (i.e. you have used the {@link #ZipArchiveOutputStream(java.io.File) File-arg constructor}) - this mode is not valid when the output
-     * stream is not seekable and the uncompressed size is unknown when {@link #putArchiveEntry} is called.
+     * stream is not seekable and the uncompressed size is unknown when {@link #putArchiveEntry} is called for entries using {@link #DEFLATED}, Zstandard, or
+     * {@link ZipMethod#XZ}.
      * </p>
      * <p>
      * If no entry inside the resulting archive requires Zip64 extensions then {@link Zip64Mode#Never Never} will create the smallest archive.
@@ -1429,8 +1532,8 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
      * bigger than the one {@link Zip64Mode#Never Never} would create.
      * </p>
      * <p>
-     * Defaults to {@link Zip64Mode#AsNeeded AsNeeded} unless {@link #putArchiveEntry} is called with an entry of unknown size and data is written to a
-     * non-seekable stream - in this case the default is {@link Zip64Mode#Never Never}.
+     * Defaults to {@link Zip64Mode#AsNeeded AsNeeded} unless {@link #putArchiveEntry} is called with an entry of unknown size for {@link #DEFLATED}, Zstandard,
+     * or {@link ZipMethod#XZ} and data is written to a non-seekable stream - in this case the effective mode is {@link Zip64Mode#Never Never}.
      * </p>
      *
      * @param mode Whether Zip64 extensions will be used.
@@ -1483,7 +1586,8 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
     }
 
     private boolean usesDataDescriptor(final int zipMethod, final boolean phased) {
-        return !phased && zipMethod == DEFLATED && !(out instanceof RandomAccessOutputStream);
+        return !phased && !(out instanceof RandomAccessOutputStream)
+                && (zipMethod == DEFLATED || ZipMethod.isZstd(zipMethod) || zipMethod == ZipMethod.XZ.getCode());
     }
 
     /**
@@ -1582,6 +1686,15 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
             throw new IllegalStateException("No current entry");
         }
         ZipUtil.checkRequestedFeatures(entry.entry);
+        if (entry.compressionPayloadWriter != null) {
+            final long writtenBefore = streamCompressor.getTotalBytesWritten();
+            entry.plaintextCrc32.update(b, offset, length);
+            entry.bytesRead += length;
+            entry.hasWritten = true;
+            entry.compressionPayloadWriter.write(b, offset, length);
+            count(streamCompressor.getTotalBytesWritten() - writtenBefore);
+            return;
+        }
         final long writtenThisTime = streamCompressor.write(b, offset, length, entry.entry.getMethod());
         count(writtenThisTime);
     }
@@ -1721,10 +1834,12 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
         }
 
         final byte[] localHeader = createLocalFileHeader(ze, name, encodable, phased, localHeaderStart);
-        metaData.put(ze, new EntryMetaData(localHeaderStart, usesDataDescriptor(ze.getMethod(), phased)));
+        final boolean dataDescriptorForMeta = usesDataDescriptor(ze.getMethod(), phased);
+        metaData.put(ze, new EntryMetaData(localHeaderStart, dataDescriptorForMeta));
         entry.localDataStart = localHeaderStart + LFH_CRC_OFFSET; // At CRC offset
         writeCounted(localHeader);
         entry.dataStart = streamCompressor.getTotalBytesWritten();
+        ze.getGeneralPurposeBit().useDataDescriptor(dataDescriptorForMeta);
     }
 
     /**
