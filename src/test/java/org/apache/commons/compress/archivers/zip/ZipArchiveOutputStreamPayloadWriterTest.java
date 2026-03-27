@@ -33,7 +33,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import java.util.zip.CRC32;
+
 import org.apache.commons.compress.archivers.ArchiveException;
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
 import org.apache.commons.compress.compressors.xz.XZCompressorInputStream;
 import org.apache.commons.compress.compressors.xz.XZCompressorOutputStream;
 import org.apache.commons.compress.compressors.zstandard.ZstdCompressorInputStream;
@@ -306,7 +309,7 @@ class ZipArchiveOutputStreamPayloadWriterTest {
 
         final ByteArrayOutputStream rawOut = new ByteArrayOutputStream();
         try (ZipArchiveOutputStream zos = new ZipArchiveOutputStream(rawOut)) {
-            zos.setCompressionPayloadWriterFactory(zipMethod.getCode(), testZstdPayloadWriterTwoEntries);
+            zos.setCompressionPayloadWriterFactory(zipMethod.getCode(), AIRLIFT_ZSTD_PAYLOAD_WRITER_FACTORY);
             final ZipArchiveEntry ze = new ZipArchiveEntry(entryName);
             ze.setMethod(zipMethod.getCode());
             zos.putArchiveEntry(ze);
@@ -343,6 +346,73 @@ class ZipArchiveOutputStreamPayloadWriterTest {
             try (InputStream in = zf.getInputStream(e)) {
                 assertEquals(0, IOUtils.toByteArray(in).length);
             }
+        }
+    }
+
+    /**
+     * BZip2 via payload writer on non-seekable output: same streaming metadata path as ZSTD without hard-coding BZIP2 in the writer.
+     */
+    @Test
+    void testBzip2PayloadWriterNonSeekableRoundtrip() throws IOException {
+        final ByteArrayOutputStream raw = new ByteArrayOutputStream();
+        final byte[] plain = "bzip2 payload writer unknown size".getBytes(StandardCharsets.UTF_8);
+        try (ZipArchiveOutputStream zos = new ZipArchiveOutputStream(raw)) {
+            zos.setCompressionPayloadWriterFactory(ZipMethod.BZIP2.getCode(), ZipCompressionPayloadWriters.bzip2());
+            final ZipArchiveEntry ze = new ZipArchiveEntry("b2.txt");
+            ze.setMethod(ZipMethod.BZIP2.getCode());
+            zos.putArchiveEntry(ze);
+            assertTrue(ze.getGeneralPurposeBit().usesDataDescriptor());
+            zos.write(plain);
+        }
+        try (SeekableByteChannel ch = new SeekableInMemoryByteChannel(raw.toByteArray());
+                ZipFile zf = ZipFile.builder().setSeekableByteChannel(ch).get()) {
+            final ZipArchiveEntry e = zf.getEntry("b2.txt");
+            assertEquals(ZipMethod.BZIP2.getCode(), e.getMethod());
+            assertEquals(plain.length, e.getSize());
+            try (InputStream in = zf.getInputStream(e)) {
+                assertTrue(in instanceof BZip2CompressorInputStream);
+                assertEquals(new String(plain, StandardCharsets.UTF_8), new String(IOUtils.toByteArray(in), StandardCharsets.UTF_8));
+            }
+        }
+    }
+
+    /**
+     * Non-enum method code with a registered factory: data descriptor and CRC/size from plaintext; reading remains unsupported in {@link ZipFile}.
+     */
+    @Test
+    void testCustomMethodCodePayloadWriterUsesDataDescriptorAndMetadata() throws IOException {
+        final int customMethod = 254;
+        final ZipCompressionPayloadWriterFactory identity = (sink, ze) -> new ZipCompressionPayloadWriter() {
+            @Override
+            public void write(final byte[] b, final int off, final int len) throws IOException {
+                sink.write(b, off, len);
+            }
+
+            @Override
+            public void finish() {
+                // identity "compression" — no trailer
+            }
+        };
+        final byte[] plain = "future-proof custom zip method code".getBytes(StandardCharsets.UTF_8);
+        final CRC32 expectCrc = new CRC32();
+        expectCrc.update(plain);
+        final ByteArrayOutputStream raw = new ByteArrayOutputStream();
+        try (ZipArchiveOutputStream zos = new ZipArchiveOutputStream(raw)) {
+            zos.setCompressionPayloadWriterFactory(customMethod, identity);
+            final ZipArchiveEntry ze = new ZipArchiveEntry("custom.txt");
+            ze.setMethod(customMethod);
+            zos.putArchiveEntry(ze);
+            assertTrue(ze.getGeneralPurposeBit().usesDataDescriptor());
+            zos.write(plain);
+        }
+        try (SeekableByteChannel ch = new SeekableInMemoryByteChannel(raw.toByteArray());
+                ZipFile zf = ZipFile.builder().setSeekableByteChannel(ch).get()) {
+            final ZipArchiveEntry e = zf.getEntry("custom.txt");
+            assertEquals(customMethod, e.getMethod());
+            assertEquals(plain.length, e.getSize());
+            assertTrue(e.getGeneralPurposeBit().usesDataDescriptor());
+            assertEquals(expectCrc.getValue(), e.getCrc());
+            assertThrows(UnsupportedZipFeatureException.class, () -> zf.getInputStream(e));
         }
     }
 }

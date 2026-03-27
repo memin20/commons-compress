@@ -1066,15 +1066,16 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
     }
 
     /**
-     * Entries that stream compressed data to a non-seekable output with unknown uncompressed size when the entry is opened (DEFLATED, ZSTD, XZ without payload
-     * writer pre-sizing).
+     * Entries that stream compressed data to a non-seekable output with unknown uncompressed size when the entry is opened (DEFLATED; ZSTD/XZ passthrough;
+     * or any method with a registered {@link ZipCompressionPayloadWriterFactory}).
      */
     private boolean isStreamingUnknownSizeCompressedEntry(final ZipArchiveEntry ze) {
         if (ze.getSize() != ArchiveEntry.SIZE_UNKNOWN) {
             return false;
         }
         final int method = ze.getMethod();
-        return method == DEFLATED || ZipMethod.isZstd(method) || method == ZipMethod.XZ.getCode();
+        return method == DEFLATED || ZipMethod.isZstd(method) || method == ZipMethod.XZ.getCode()
+                || hasCompressionPayloadWriterFactory(method);
     }
 
     /**
@@ -1141,12 +1142,13 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
             entry.entry.setSize(entry.bytesRead);
             entry.entry.setCompressedSize(bytesWritten);
             entry.entry.setCrc(crc);
+        } else if (entry.usesCompressionPayloadWriter) {
+            entry.entry.setCompressedSize(bytesWritten);
+            entry.entry.setCrc(crc);
+            entry.entry.setSize(entry.bytesRead);
         } else if (ZipMethod.isZstd(zipMethod) || zipMethod == ZipMethod.XZ.getCode()) {
             entry.entry.setCompressedSize(bytesWritten);
             entry.entry.setCrc(crc);
-            if (entry.usesCompressionPayloadWriter) {
-                entry.entry.setSize(entry.bytesRead);
-            }
         } else if (!(out instanceof RandomAccessOutputStream)) {
             if (entry.entry.getCrc() != crc) {
                 throw new ZipException("Bad CRC checksum for entry " + entry.entry.getName() + ": " + Long.toHexString(entry.entry.getCrc()) + " instead of " +
@@ -1585,9 +1587,17 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
                                                           */
     }
 
+    /**
+     * @return whether a {@link ZipCompressionPayloadWriterFactory} is registered for the compression method.
+     */
+    private boolean hasCompressionPayloadWriterFactory(final int zipMethod) {
+        return compressionPayloadWriterFactories.containsKey(zipMethod);
+    }
+
     private boolean usesDataDescriptor(final int zipMethod, final boolean phased) {
         return !phased && !(out instanceof RandomAccessOutputStream)
-                && (zipMethod == DEFLATED || ZipMethod.isZstd(zipMethod) || zipMethod == ZipMethod.XZ.getCode());
+                && (zipMethod == DEFLATED || ZipMethod.isZstd(zipMethod) || zipMethod == ZipMethod.XZ.getCode()
+                        || hasCompressionPayloadWriterFactory(zipMethod));
     }
 
     /**
@@ -1685,7 +1695,9 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream<ZipArchiveEntry>
         if (entry == null) {
             throw new IllegalStateException("No current entry");
         }
-        ZipUtil.checkRequestedFeatures(entry.entry);
+        if (entry.compressionPayloadWriter == null) {
+            ZipUtil.checkRequestedFeatures(entry.entry);
+        }
         if (entry.compressionPayloadWriter != null) {
             final long writtenBefore = streamCompressor.getTotalBytesWritten();
             entry.plaintextCrc32.update(b, offset, length);
