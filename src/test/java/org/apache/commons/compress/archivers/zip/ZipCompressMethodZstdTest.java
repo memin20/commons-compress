@@ -19,6 +19,7 @@
 package org.apache.commons.compress.archivers.zip;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import java.io.ByteArrayInputStream;
@@ -35,10 +36,10 @@ import java.nio.file.Path;
 import java.util.zip.CRC32;
 
 import org.apache.commons.compress.AbstractTest;
-import org.apache.commons.compress.utils.SeekableInMemoryByteChannel;
 import org.apache.commons.compress.compressors.zstandard.ZstdCompressorInputStream;
 import org.apache.commons.compress.compressors.zstandard.ZstdCompressorOutputStream;
 import org.apache.commons.compress.compressors.zstandard.ZstdUtils;
+import org.apache.commons.compress.utils.SeekableInMemoryByteChannel;
 import org.apache.commons.io.IOUtils;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
@@ -149,7 +150,8 @@ class ZipCompressMethodZstdTest extends AbstractTest {
     }
 
     /**
-     * Non-seekable ZIP: plain ZSTD payload via {@link ZipCompressionPayloadWriters}, unknown size up front, sizes/CRC in data descriptor.
+     * Non-seekable ZIP: ZSTD payload via {@link ZipCompressionPayloadWriters} is buffered; local header and central directory contain CRC and sizes (no data
+     * descriptor).
      */
     @ParameterizedTest
     @EnumSource(names = { "ZSTD", "ZSTD_DEPRECATED" })
@@ -166,7 +168,6 @@ class ZipCompressMethodZstdTest extends AbstractTest {
             final ZipArchiveEntry archiveEntry = new ZipArchiveEntry(entryName);
             archiveEntry.setMethod(zipMethod.getCode());
             zipOutputStream.putArchiveEntry(archiveEntry);
-            assertTrue("data descriptor expected", archiveEntry.getGeneralPurposeBit().usesDataDescriptor());
             zipOutputStream.write(plainText);
             // close() (try-with-resources) calls finish(), which closes the open payload-compressed entry
         }
@@ -177,6 +178,7 @@ class ZipCompressMethodZstdTest extends AbstractTest {
             assertEquals(zipMethod.getCode(), entry.getMethod());
             assertEquals(expectedCrc.getValue(), entry.getCrc());
             assertEquals(plainText.length, entry.getSize());
+            assertFalse(entry.getGeneralPurposeBit().usesDataDescriptor());
             assertTrue(entry.getCompressedSize() > 0);
             try (InputStream inputStream = zipFile.getInputStream(entry)) {
                 final byte[] readBack = IOUtils.toByteArray(inputStream);

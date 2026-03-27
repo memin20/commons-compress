@@ -20,6 +20,8 @@ package org.apache.commons.compress.archivers.zip;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -32,13 +34,11 @@ import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-
+import java.util.Arrays;
 import java.util.zip.CRC32;
 
 import org.apache.commons.compress.archivers.ArchiveException;
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
-import org.apache.commons.compress.compressors.xz.XZCompressorInputStream;
-import org.apache.commons.compress.compressors.xz.XZCompressorOutputStream;
 import org.apache.commons.compress.compressors.zstandard.ZstdCompressorInputStream;
 import org.apache.commons.compress.compressors.zstandard.ZstdCompressorOutputStream;
 import org.apache.commons.compress.compressors.zstandard.ZstdUtils;
@@ -54,8 +54,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 import io.airlift.compress.zstd.ZstdOutputStream;
 
 /**
- * Regression and feature tests for {@link ZipArchiveOutputStream#setCompressionPayloadWriterFactory}, data descriptors for Zstandard/XZ on non-seekable outputs,
- * and {@link ZipArchiveOutputStream#finish()}/{@link ZipArchiveOutputStream#close()} behavior.
+ * Regression and feature tests for {@link ZipArchiveOutputStream#setCompressionPayloadWriterFactory}, buffering of payload-compressed entries on non-seekable
+ * outputs (local file header with CRC/sizes instead of a data descriptor), and {@link ZipArchiveOutputStream#finish()}/{@link ZipArchiveOutputStream#close()}
+ * behavior.
  */
 class ZipArchiveOutputStreamPayloadWriterTest {
 
@@ -63,7 +64,15 @@ class ZipArchiveOutputStreamPayloadWriterTest {
     Path tempDir;
 
     private static final int ZSTD_LEVEL = 3;
-    private static final int XZ_LEVEL = 6;
+
+    /** Offsets of fields in the local file header (fixed prefix up to file name length). */
+    private static final int LFH_GPB_OFFSET = 6;
+
+    private static final int LFH_CRC_OFFSET = 14;
+    private static final int LFH_COMPRESSED_SIZE_OFFSET = 18;
+    private static final int LFH_UNCOMPRESSED_SIZE_OFFSET = 22;
+
+    private static final int GPB_DATA_DESCRIPTOR_FLAG = 1 << 3;
 
     /**
      * Airlift {@link ZstdOutputStream} as entry payload compressor; frames must remain decodable by {@link ZstdCompressorInputStream}.
@@ -110,19 +119,38 @@ class ZipArchiveOutputStreamPayloadWriterTest {
         };
     }
 
+    /**
+     * On seekable {@link ZipArchiveOutputStream}, CRC and sizes are written into the local file header when the entry is closed; they must match the central
+     * directory. The data-descriptor flag must not be set in the LFH.
+     */
+    private static void assertLocalHeaderCrcAndSizesMatchCentralDirectory(final byte[] zip, final ZipArchiveEntry entry) {
+        final int localOffset = Math.toIntExact(entry.getLocalHeaderOffset());
+        assertTrue(localOffset >= 0 && localOffset + LFH_UNCOMPRESSED_SIZE_OFFSET + 4 <= zip.length);
+        assertEquals(ZipLong.LFH_SIG.getValue(), ZipLong.getValue(zip, localOffset));
+        final int gpb = ZipShort.getValue(zip, localOffset + LFH_GPB_OFFSET);
+        assertEquals(0, gpb & GPB_DATA_DESCRIPTOR_FLAG, "LFH must not use data descriptor when writing to a seekable destination");
+        assertFalse(entry.getGeneralPurposeBit().usesDataDescriptor(), "central directory: no data descriptor on seekable output");
+        assertEquals(entry.getCrc(), ZipLong.getValue(zip, localOffset + LFH_CRC_OFFSET), "LFH CRC must match CD");
+        assertEquals(entry.getCompressedSize(), ZipLong.getValue(zip, localOffset + LFH_COMPRESSED_SIZE_OFFSET), "LFH compressed size must match CD");
+        assertEquals(entry.getSize(), ZipLong.getValue(zip, localOffset + LFH_UNCOMPRESSED_SIZE_OFFSET), "LFH uncompressed size must match CD");
+    }
+
+    private static ZipCompressionPayloadWriterFactory factoryAssertingEntry(
+            final ZipCompressionPayloadWriterFactory delegate,
+            final int expectedMethod,
+            final String expectedName) {
+        return (sink, entry) -> {
+            assertEquals(expectedMethod, entry.getMethod(), "ZIP method passed to payload writer factory");
+            assertEquals(expectedName, entry.getName(), "entry name passed to payload writer factory");
+            return delegate.create(sink, entry);
+        };
+    }
+
     private static void compressZstd(final InputStream input, final OutputStream output) throws IOException {
         @SuppressWarnings("resource")
         final ZstdCompressorOutputStream zOut = new ZstdCompressorOutputStream(output, ZSTD_LEVEL, true);
         IOUtils.copyLarge(input, zOut);
         zOut.flush();
-    }
-
-    private static void compressXz(final InputStream input, final OutputStream output) throws IOException {
-        @SuppressWarnings("resource")
-        final XZCompressorOutputStream xzOut = new XZCompressorOutputStream(output, XZ_LEVEL);
-        IOUtils.copyLarge(input, xzOut);
-        xzOut.flush();
-        xzOut.finish();
     }
 
     /** DEFLATED without closing the entry: {@link ZipArchiveOutputStream#finish()} must still fail (unchanged contract). */
@@ -157,8 +185,8 @@ class ZipArchiveOutputStreamPayloadWriterTest {
     }
 
     /**
-     * Legacy ZSTD path: no payload factory, pre-compressed bytes, {@link ZipMethod#ZSTD} on a non-seekable stream: archive must round-trip and local metadata
-     * must use a data descriptor (CRC/sizes after payload).
+     * Legacy ZSTD path: no payload factory, pre-compressed bytes on a non-seekable stream — payload is buffered so local header carries CRC and sizes (no data
+     * descriptor).
      */
     @ParameterizedTest
     @EnumSource(names = { "ZSTD", "ZSTD_DEPRECATED" })
@@ -172,7 +200,6 @@ class ZipArchiveOutputStreamPayloadWriterTest {
             ze.setMethod(zipMethod.getCode());
             ze.setSize(plain.length);
             zos.putArchiveEntry(ze);
-            assertTrue(ze.getGeneralPurposeBit().usesDataDescriptor(), "non-seekable ZSTD must defer CRC/sizes");
             compressZstd(new ByteArrayInputStream(plain), zos);
             zos.closeArchiveEntry();
         }
@@ -180,40 +207,10 @@ class ZipArchiveOutputStreamPayloadWriterTest {
                 ZipFile zf = ZipFile.builder().setSeekableByteChannel(ch).get()) {
             final ZipArchiveEntry e = zf.getEntry(name);
             assertEquals(zipMethod.getCode(), e.getMethod());
-            assertTrue(e.getGeneralPurposeBit().usesDataDescriptor());
+            assertFalse(e.getGeneralPurposeBit().usesDataDescriptor());
             assertEquals(plain.length, e.getSize());
             try (InputStream in = zf.getInputStream(e)) {
                 assertTrue(in instanceof ZstdCompressorInputStream);
-                assertEquals(new String(plain, StandardCharsets.UTF_8), new String(IOUtils.toByteArray(in), StandardCharsets.UTF_8));
-            }
-        }
-    }
-
-    /**
-     * Legacy XZ path on a non-{@link org.apache.commons.compress.archivers.zip.RandomAccessOutputStream} sink (plain {@link java.io.OutputStream} to a file): same
-     * data-descriptor behavior as Zstandard, archive must round-trip.
-     */
-    @Test
-    void testXzPassthroughOnNonSeekableStreamStillWorks() throws IOException {
-        final String name = "xz-legacy.txt";
-        final byte[] plain = "legacy passthrough xz".getBytes(StandardCharsets.UTF_8);
-        final Path zipFile = tempDir.resolve("xz-nonseek.zip");
-        try (ZipArchiveOutputStream zos = new ZipArchiveOutputStream(Files.newOutputStream(zipFile))) {
-            assertFalse(zos.isSeekable());
-            final ZipArchiveEntry ze = new ZipArchiveEntry(name);
-            ze.setMethod(ZipMethod.XZ.getCode());
-            ze.setSize(plain.length);
-            zos.putArchiveEntry(ze);
-            assertTrue(ze.getGeneralPurposeBit().usesDataDescriptor());
-            compressXz(new ByteArrayInputStream(plain), zos);
-            zos.closeArchiveEntry();
-        }
-        try (ZipFile zf = ZipFile.builder().setPath(zipFile).get()) {
-            final ZipArchiveEntry e = zf.getEntry(name);
-            assertEquals(ZipMethod.XZ.getCode(), e.getMethod());
-            assertTrue(e.getGeneralPurposeBit().usesDataDescriptor());
-            try (InputStream in = zf.getInputStream(e)) {
-                assertTrue(in instanceof XZCompressorInputStream);
                 assertEquals(new String(plain, StandardCharsets.UTF_8), new String(IOUtils.toByteArray(in), StandardCharsets.UTF_8));
             }
         }
@@ -350,7 +347,8 @@ class ZipArchiveOutputStreamPayloadWriterTest {
     }
 
     /**
-     * BZip2 via payload writer on non-seekable output: same streaming metadata path as ZSTD without hard-coding BZIP2 in the writer.
+     * BZip2 via payload writer on non-seekable output: compressed payload is buffered so the local header and central directory carry CRC and sizes (no data
+     * descriptor).
      */
     @Test
     void testBzip2PayloadWriterNonSeekableRoundtrip() throws IOException {
@@ -361,7 +359,6 @@ class ZipArchiveOutputStreamPayloadWriterTest {
             final ZipArchiveEntry ze = new ZipArchiveEntry("b2.txt");
             ze.setMethod(ZipMethod.BZIP2.getCode());
             zos.putArchiveEntry(ze);
-            assertTrue(ze.getGeneralPurposeBit().usesDataDescriptor());
             zos.write(plain);
         }
         try (SeekableByteChannel ch = new SeekableInMemoryByteChannel(raw.toByteArray());
@@ -369,6 +366,8 @@ class ZipArchiveOutputStreamPayloadWriterTest {
             final ZipArchiveEntry e = zf.getEntry("b2.txt");
             assertEquals(ZipMethod.BZIP2.getCode(), e.getMethod());
             assertEquals(plain.length, e.getSize());
+            assertFalse(e.getGeneralPurposeBit().usesDataDescriptor());
+            assertTrue(e.getCompressedSize() > 0);
             try (InputStream in = zf.getInputStream(e)) {
                 assertTrue(in instanceof BZip2CompressorInputStream);
                 assertEquals(new String(plain, StandardCharsets.UTF_8), new String(IOUtils.toByteArray(in), StandardCharsets.UTF_8));
@@ -377,10 +376,165 @@ class ZipArchiveOutputStreamPayloadWriterTest {
     }
 
     /**
-     * Non-enum method code with a registered factory: data descriptor and CRC/size from plaintext; reading remains unsupported in {@link ZipFile}.
+     * Seekable ZIP ({@link Path}): local file header CRC and sizes match the central directory for DEFLATED, BZip2 payload writer, and Zstandard payload writer
+     * (no Zip64, no data descriptor in LFH).
      */
     @Test
-    void testCustomMethodCodePayloadWriterUsesDataDescriptorAndMetadata() throws IOException {
+    void testSeekablePathLocalHeaderMatchesCentralDirectory() throws IOException {
+        Assumptions.assumeTrue(ZstdUtils.isZstdCompressionAvailable());
+        final Path zip = tempDir.resolve("seekable-lfh-cd.zip");
+        try (ZipArchiveOutputStream zos = ZipArchiveOutputStream.builder(zip)
+                .setCompressionPayloadWriterFactory(ZipMethod.BZIP2.getCode(), ZipCompressionPayloadWriters.bzip2())
+                .setCompressionPayloadWriterFactory(ZipMethod.ZSTD.getCode(), ZipCompressionPayloadWriters.zstd(ZSTD_LEVEL))
+                .build()) {
+            assertTrue(zos.isSeekable());
+
+            final ZipArchiveEntry eDeflate = new ZipArchiveEntry("deflated.txt");
+            eDeflate.setMethod(ZipArchiveOutputStream.DEFLATED);
+            zos.putArchiveEntry(eDeflate);
+            zos.write("seekable deflate payload".getBytes(StandardCharsets.UTF_8));
+            zos.closeArchiveEntry();
+
+            final ZipArchiveEntry eBz = new ZipArchiveEntry("bzip2.txt");
+            eBz.setMethod(ZipMethod.BZIP2.getCode());
+            zos.putArchiveEntry(eBz);
+            zos.write("seekable bzip2 payload".getBytes(StandardCharsets.UTF_8));
+            zos.closeArchiveEntry();
+
+            final ZipArchiveEntry eZst = new ZipArchiveEntry("zstd.txt");
+            eZst.setMethod(ZipMethod.ZSTD.getCode());
+            zos.putArchiveEntry(eZst);
+            zos.write("seekable zstd payload".getBytes(StandardCharsets.UTF_8));
+            zos.closeArchiveEntry();
+        }
+        final byte[] zipBytes = Files.readAllBytes(zip);
+        try (ZipFile zf = ZipFile.builder().setPath(zip).get()) {
+            for (final String name : new String[] { "deflated.txt", "bzip2.txt", "zstd.txt" }) {
+                final ZipArchiveEntry e = zf.getEntry(name);
+                assertNotNull(e);
+                assertLocalHeaderCrcAndSizesMatchCentralDirectory(zipBytes, e);
+            }
+        }
+    }
+
+    /**
+     * Same LFH/CD consistency as {@link #testSeekablePathLocalHeaderMatchesCentralDirectory()} for {@link ZipArchiveOutputStream#ZipArchiveOutputStream(
+     * java.nio.channels.SeekableByteChannel)}.
+     */
+    @Test
+    void testSeekableChannelLocalHeaderMatchesCentralDirectoryPayloadWriter() throws IOException {
+        final SeekableInMemoryByteChannel ch = new SeekableInMemoryByteChannel();
+        final ZipArchiveOutputStream zos = ZipArchiveOutputStream.builder(ch)
+                .setCompressionPayloadWriterFactory(ZipMethod.BZIP2.getCode(), ZipCompressionPayloadWriters.bzip2())
+                .build();
+        try {
+            assertTrue(zos.isSeekable());
+            final ZipArchiveEntry ze = new ZipArchiveEntry("only-bzip2.txt");
+            ze.setMethod(ZipMethod.BZIP2.getCode());
+            zos.putArchiveEntry(ze);
+            zos.write("in-memory seekable channel".getBytes(StandardCharsets.UTF_8));
+            zos.closeArchiveEntry();
+            zos.finish();
+            final byte[] zipBytes = Arrays.copyOf(ch.array(), Math.toIntExact(ch.size()));
+            try (SeekableByteChannel zch = new SeekableInMemoryByteChannel(zipBytes); ZipFile zf = ZipFile.builder().setSeekableByteChannel(zch).get()) {
+                final ZipArchiveEntry e = zf.getEntry("only-bzip2.txt");
+                assertNotNull(e);
+                assertEquals(ZipMethod.BZIP2.getCode(), e.getMethod());
+                assertLocalHeaderCrcAndSizesMatchCentralDirectory(zipBytes, e);
+                try (InputStream in = zf.getInputStream(e)) {
+                    assertTrue(in instanceof BZip2CompressorInputStream);
+                }
+            }
+        } finally {
+            zos.close();
+        }
+    }
+
+    /**
+     * One archive, two entries — two different {@link ZipCompressionPayloadWriterFactory} registrations: {@link ZipCompressionPayloadWriters#zstd(int)} and
+     * {@link ZipCompressionPayloadWriters#bzip2()}. Each wrapper asserts {@link ZipArchiveOutputStream} passes the correct {@link ZipArchiveEntry} to {@code
+     * create}. Round-trip via {@link ZipFile} and sequential {@link ZipArchiveInputStream#getNextZipEntry()} (non-seekable ZIP: payload buffered, local headers
+     * hold CRC and sizes).
+     */
+    @Test
+    void testRoundtripTwoDifferentPayloadWriterFactories() throws IOException {
+        Assumptions.assumeTrue(ZstdUtils.isZstdCompressionAvailable());
+        final String nameZstd = "a/zstd.txt";
+        final String nameBzip2 = "b/bzip2.txt";
+        final byte[] plainZstd = "first entry zstd payload".getBytes(StandardCharsets.UTF_8);
+        final byte[] plainBzip2 = "second entry bzip2 payload".getBytes(StandardCharsets.UTF_8);
+
+        final ByteArrayOutputStream raw = new ByteArrayOutputStream();
+        try (ZipArchiveOutputStream zos = new ZipArchiveOutputStream(raw)) {
+            zos.setCompressionPayloadWriterFactory(ZipMethod.ZSTD.getCode(),
+                    factoryAssertingEntry(ZipCompressionPayloadWriters.zstd(ZSTD_LEVEL), ZipMethod.ZSTD.getCode(), nameZstd));
+            zos.setCompressionPayloadWriterFactory(ZipMethod.BZIP2.getCode(),
+                    factoryAssertingEntry(ZipCompressionPayloadWriters.bzip2(), ZipMethod.BZIP2.getCode(), nameBzip2));
+
+            final ZipArchiveEntry e1 = new ZipArchiveEntry(nameZstd);
+            e1.setMethod(ZipMethod.ZSTD.getCode());
+            zos.putArchiveEntry(e1);
+            zos.write(plainZstd);
+            zos.closeArchiveEntry();
+
+            final ZipArchiveEntry e2 = new ZipArchiveEntry(nameBzip2);
+            e2.setMethod(ZipMethod.BZIP2.getCode());
+            zos.putArchiveEntry(e2);
+            zos.write(plainBzip2);
+            zos.closeArchiveEntry();
+        }
+
+        final byte[] zipBytes = raw.toByteArray();
+
+        try (SeekableByteChannel ch = new SeekableInMemoryByteChannel(zipBytes);
+                ZipFile zf = ZipFile.builder().setSeekableByteChannel(ch).get()) {
+            final ZipArchiveEntry zst = zf.getEntry(nameZstd);
+            assertNotNull(zst);
+            assertEquals(ZipMethod.ZSTD.getCode(), zst.getMethod());
+            assertEquals(plainZstd.length, zst.getSize());
+            try (InputStream in = zf.getInputStream(zst)) {
+                assertTrue(in instanceof ZstdCompressorInputStream);
+                assertEquals(new String(plainZstd, StandardCharsets.UTF_8), new String(IOUtils.toByteArray(in), StandardCharsets.UTF_8));
+            }
+            final ZipArchiveEntry bz = zf.getEntry(nameBzip2);
+            assertNotNull(bz);
+            assertEquals(ZipMethod.BZIP2.getCode(), bz.getMethod());
+            assertEquals(plainBzip2.length, bz.getSize());
+            try (InputStream in = zf.getInputStream(bz)) {
+                assertTrue(in instanceof BZip2CompressorInputStream);
+                assertEquals(new String(plainBzip2, StandardCharsets.UTF_8), new String(IOUtils.toByteArray(in), StandardCharsets.UTF_8));
+            }
+        }
+
+        try (ZipArchiveInputStream zin = new ZipArchiveInputStream(new ByteArrayInputStream(zipBytes))) {
+            final ZipArchiveEntry eFirst = zin.getNextZipEntry();
+            assertNotNull(eFirst);
+            assertEquals(nameZstd, eFirst.getName());
+            assertEquals(ZipMethod.ZSTD.getCode(), eFirst.getMethod());
+            assertTrue(zin.canReadEntryData(eFirst), "Zstd entry must be readable");
+            final byte[] readZstd = IOUtils.toByteArray(zin);
+            assertEquals(plainZstd.length, readZstd.length);
+            assertEquals(new String(plainZstd, StandardCharsets.UTF_8), new String(readZstd, StandardCharsets.UTF_8));
+
+            final ZipArchiveEntry eSecond = zin.getNextZipEntry();
+            assertNotNull(eSecond);
+            assertEquals(nameBzip2, eSecond.getName());
+            assertEquals(ZipMethod.BZIP2.getCode(), eSecond.getMethod());
+            assertTrue(zin.canReadEntryData(eSecond), "BZIP2 entry must be readable");
+            final byte[] readBzip2 = IOUtils.toByteArray(zin);
+            assertEquals(plainBzip2.length, readBzip2.length);
+            assertEquals(new String(plainBzip2, StandardCharsets.UTF_8), new String(readBzip2, StandardCharsets.UTF_8));
+
+            assertNull(zin.getNextZipEntry());
+        }
+    }
+
+    /**
+     * Non-enum method code with a registered factory: buffered payload, local header and CD carry CRC and sizes from plaintext; {@link ZipFile} cannot decode the
+     * method-specific payload.
+     */
+    @Test
+    void testCustomMethodCodePayloadWriterWritesLocalMetadataAndBody() throws IOException {
         final int customMethod = 254;
         final ZipCompressionPayloadWriterFactory identity = (sink, ze) -> new ZipCompressionPayloadWriter() {
             @Override
@@ -402,7 +556,6 @@ class ZipArchiveOutputStreamPayloadWriterTest {
             final ZipArchiveEntry ze = new ZipArchiveEntry("custom.txt");
             ze.setMethod(customMethod);
             zos.putArchiveEntry(ze);
-            assertTrue(ze.getGeneralPurposeBit().usesDataDescriptor());
             zos.write(plain);
         }
         try (SeekableByteChannel ch = new SeekableInMemoryByteChannel(raw.toByteArray());
@@ -410,8 +563,9 @@ class ZipArchiveOutputStreamPayloadWriterTest {
             final ZipArchiveEntry e = zf.getEntry("custom.txt");
             assertEquals(customMethod, e.getMethod());
             assertEquals(plain.length, e.getSize());
-            assertTrue(e.getGeneralPurposeBit().usesDataDescriptor());
+            assertFalse(e.getGeneralPurposeBit().usesDataDescriptor());
             assertEquals(expectCrc.getValue(), e.getCrc());
+            assertEquals(plain.length, e.getCompressedSize());
             assertThrows(UnsupportedZipFeatureException.class, () -> zf.getInputStream(e));
         }
     }
